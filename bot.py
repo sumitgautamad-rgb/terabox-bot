@@ -2,6 +2,7 @@
 TeraBox Ad-Free Video Telegram Bot
 Universal - Sabhi TeraBox links chalega.
 Engine: Cloudflare HLS Stream via teraplayer API (retry + fallback).
+Features: Force Channel Subscription (F-Sub) + Health check for 24/7 Render deployment.
 """
 import sys, os, re, json, asyncio, logging, urllib.parse, html, time, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -12,13 +13,50 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.constants import ParseMode, ChatAction
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode, ChatAction, ChatMemberStatus
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    filters,
+    ContextTypes,
+)
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBAPP_BASE = "https://sumitgautamad-rgb.github.io/teraplayer/"
+
+# ============================================================
+# Force Channel Subscription Configuration
+# ============================================================
+FORCE_CHANNEL_ID = -1003944764432
+FORCE_CHANNEL_LINK = "https://t.me/+RSEzFEAyHphmZjBl"
+
+async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Check if the user has joined the compulsory channel."""
+    try:
+        member = await context.bot.get_chat_member(chat_id=FORCE_CHANNEL_ID, user_id=user_id)
+        status_str = str(getattr(member, 'status', member)).lower()
+        return any(s in status_str for s in ['member', 'admin', 'owner', 'creator'])
+    except Exception as e:
+        logger.info(f"User {user_id} is not subscribed to {FORCE_CHANNEL_ID}: {e}")
+        return False
+
+def get_force_sub_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join Channel", url=FORCE_CHANNEL_LINK)],
+        [InlineKeyboardButton("✅ Joined / Check Status", callback_data="check_sub")]
+    ])
+
+FORCE_SUB_MSG = (
+    "⚠️ <b>Access Restricted!</b>\n\n"
+    "Bot ko use karne ke liye pehle hamara Telegram Channel join karna compulsory hai.\n\n"
+    "1️⃣ Niche <b>'📢 Join Channel'</b> par click karke channel join karein.\n"
+    "2️⃣ Uske baad <b>'✅ Joined / Check Status'</b> button dabayein."
+)
 
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
@@ -66,22 +104,16 @@ def find_terabox_url(text):
 # ============================================================
 API_URL = 'https://teraplayer-backend-temp.onrender.com/api/download'
 MAX_RETRIES = 3
-RETRY_DELAYS = [3, 8, 15]  # seconds between retries
+RETRY_DELAYS = [3, 8, 15]
 
 def extract_video(terabox_url: str) -> dict | None:
-    """
-    Call teraplayer API with retry + exponential backoff.
-    Works for ALL TeraBox links universally.
-    Returns dict with: filename, size_str, duration_str, resolution, stream_url, thumbnail
-    Returns None on failure.
-    """
     for attempt in range(MAX_RETRIES):
         try:
             logger.info(f"Attempt {attempt + 1}/{MAX_RETRIES} for: {terabox_url}")
             r = session.post(
                 API_URL,
                 json={'url': terabox_url},
-                timeout=30,  # 30s for cold start
+                timeout=30,
             )
 
             if r.status_code == 200:
@@ -94,7 +126,6 @@ def extract_video(terabox_url: str) -> dict | None:
                     stream_url = d.get('stream_url', '')
                     thumbnail = d.get('thumbnail') or ''
 
-                    # Format duration as MM:SS
                     duration_str = ''
                     if duration:
                         m, s = divmod(int(duration), 60)
@@ -110,43 +141,32 @@ def extract_video(terabox_url: str) -> dict | None:
                         'thumbnail': thumbnail,
                     }
                 else:
-                    err = d.get('error') or 'Unknown error from API'
+                    err = d.get('error') or 'Unknown error'
                     logger.warning(f"API ok=false: {err}")
                     if 'password' in str(err).lower():
                         return {'error': '🔒 Yeh link password protected hai.'}
 
-            elif r.status_code == 503 or r.status_code == 502:
+            elif r.status_code in [502, 503]:
                 logger.warning(f"Server unavailable (attempt {attempt + 1}), retrying...")
             else:
                 logger.warning(f"API returned status {r.status_code}")
 
         except requests.exceptions.Timeout:
             logger.warning(f"Timeout on attempt {attempt + 1}")
-        except requests.exceptions.ConnectionError as e:
-            logger.warning(f"Connection error attempt {attempt + 1}: {e}")
         except Exception as e:
-            logger.warning(f"Unexpected error attempt {attempt + 1}: {e}")
+            logger.warning(f"Error on attempt {attempt + 1}: {e}")
 
-        # Wait before retry (except on last attempt)
         if attempt < MAX_RETRIES - 1:
-            delay = RETRY_DELAYS[attempt]
-            logger.info(f"Waiting {delay}s before retry...")
-            time.sleep(delay)
+            time.sleep(RETRY_DELAYS[attempt])
 
     return None
 
 
 def process_terabox_link(url: str) -> dict:
-    """
-    Process with caching. Returns result dict or {'error': '...'}.
-    """
     now = time.time()
-
-    # Check cache
     if url in video_cache:
         item = video_cache[url]
         if now - item['time'] < CACHE_EXPIRY:
-            logger.info(f"Cache hit: {url}")
             return item['data']
         else:
             del video_cache[url]
@@ -154,7 +174,7 @@ def process_terabox_link(url: str) -> dict:
     data = extract_video(url)
 
     if not data:
-        return {'error': '❌ Video link process nahi ho paya.\n\nKaran:\n• TeraBox server busy hai\n• Link expire ho gaya\n• Private/deleted file\n\nThodi der baad dobara try karein.'}
+        return {'error': '❌ Video link process nahi ho paya. Kripya check karein ki TeraBox link valid hai.'}
 
     if 'error' in data:
         return data
@@ -191,26 +211,89 @@ def process_terabox_link(url: str) -> dict:
 # ============================================================
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # 1. Force Subscription check
+    if not await is_subscribed(context, user_id):
+        await update.message.reply_text(
+            FORCE_SUB_MSG,
+            reply_markup=get_force_sub_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     welcome = (
-        "🎬 <b>TeraBox Ad-Free Player Bot</b>\n\n"
-        "Koi bhi TeraBox link bhejo — video Telegram ke andar hi chalega!\n"
-        "Zero Ads. Zero Redirects. 100% Free.\n\n"
+        "🎬 <b>TeraBox Video Player Bot</b>\n\n"
+        "Koi bhi TeraBox link bhejo — video seedha play hoga!\n\n"
         "📌 <b>Supported sites:</b>\n"
         "• 1024terabox.com\n"
         "• terabox.com / teraboxapp.com\n"
-        "• freeterabox.com\n"
-        "• Aur bhi sabhi TeraBox mirror sites\n\n"
-        "✨ <b>Features:</b>\n"
-        "• 🚫 No Ads, No Popups\n"
-        "• ▶️ Seedha Telegram mein play\n"
-        "• 🌐 Browser mein bhi dekh sakte hain\n"
-        "• ⚡ Fast HLS streaming\n"
-        "• 🔄 Har link support"
+        "• freeterabox.com aur sabhi mirror sites\n\n"
+        "✨ <b>Kaise use karein:</b>\n"
+        "Apna TeraBox video link yahan paste karein aur bhejein!"
     )
     await update.message.reply_text(welcome, parse_mode=ParseMode.HTML)
 
 
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if query.data == "check_sub":
+        if await is_subscribed(context, user_id):
+            await query.answer("✅ Verified! Ab aap bot use kar sakte hain.", show_alert=True)
+            welcome_after = (
+                "✅ <b>Welcome! Channel verified.</b>\n\n"
+                "Ab aap koi bhi TeraBox link yahan bhej sakte hain, video play ho jayegi! 🎬"
+            )
+            try:
+                await query.edit_message_text(welcome_after, parse_mode=ParseMode.HTML)
+            except Exception:
+                await query.message.reply_text(welcome_after, parse_mode=ParseMode.HTML)
+        else:
+            await query.answer(
+                "❌ Aapne abhi tak channel join nahi kiya hai! Kripya pehle 'Join Channel' par click karke channel join karein.",
+                show_alert=True
+            )
+
+
+async def setchannel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows manual setting of channel ID: /setchannel -100xxxxxxxxxx"""
+    if context.args:
+        try:
+            cid = int(context.args[0])
+            await update.message.reply_text(
+                f"✅ Force Sub Channel ID: <code>{cid}</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        except ValueError:
+            pass
+    await update.message.reply_text(
+        f"Channel ID: <code>{FORCE_CHANNEL_ID}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def chat_member_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-detect Channel ID when bot is added as Admin in the channel."""
+    if update.my_chat_member:
+        chat = update.my_chat_member.chat
+        logger.info(f"Chat Member Updated: {chat.id} ({chat.title})")
+
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # Check Force Subscription
+    if not await is_subscribed(context, user_id):
+        await update.message.reply_text(
+            FORCE_SUB_MSG,
+            reply_markup=get_force_sub_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     text = update.message.text or ''
     terabox_url = find_terabox_url(text)
 
@@ -251,7 +334,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     safe_filename = html.escape(filename)
 
-    # Build caption
     lines = [f"🎬 <b>{safe_filename}</b>\n"]
     if size_str:
         lines.append(f"📦 <b>Size:</b> <code>{html.escape(size_str)}</code>")
@@ -259,7 +341,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"🖥️ <b>Quality:</b> <code>{html.escape(resolution)}</code>")
     if duration_str:
         lines.append(f"⏱️ <b>Duration:</b> <code>{html.escape(duration_str)}</code>")
-    lines.append("\n🛡️ <b>100% Ad-Free</b> — Koi ads nahi!")
     lines.append("\n👇 <b>Niche button tap karein:</b>")
 
     caption = "\n".join(lines)
@@ -267,7 +348,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "▶️ Play Video (No Ads)",
+                "▶️ Play Video",
                 web_app=WebAppInfo(url=webapp_url)
             )
         ],
@@ -280,7 +361,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     try:
-        # Try to send with thumbnail if available
         if thumbnail:
             try:
                 await status_msg.delete()
@@ -295,7 +375,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Thumbnail send failed: {e}, falling back to text")
 
-        # Text message
         await status_msg.edit_text(
             caption,
             reply_markup=keyboard,
@@ -304,11 +383,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Message send error: {e}")
-        # Plain text fallback
         plain = (
             f"🎬 {filename}\n\n"
-            f"📦 Size: {size_str}\n"
-            f"🛡️ 100% Ad-Free\n\n"
+            f"📦 Size: {size_str}\n\n"
             "👇 Niche button tap karein:"
         )
         try:
@@ -350,10 +427,13 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("setchannel", setchannel_handler))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(ChatMemberHandler(chat_member_update_handler, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("✅ Bot polling started! Sabhi TeraBox links support hain.")
+    logger.info("✅ Bot polling started with Force Channel Subscription!")
     app.run_polling(drop_pending_updates=True)
 
 
