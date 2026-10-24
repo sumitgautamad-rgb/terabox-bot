@@ -136,6 +136,7 @@ TERABOX_DOMAINS = [
     '4funbox.com', 'momerybox.com', 'tibibox.com',
     'teraboxlink.com', 'terafileshare.com', 'terasharelink.com',
     'www.terabox.club', 'terabox.club',
+    'teraboxshare.com', 'terashare.net', 'teraboxh5.com',
 ]
 
 def find_terabox_url(text):
@@ -159,15 +160,15 @@ def extract_quick_title(terabox_url: str) -> str:
     return "TeraBox Video"
 
 # ============================================================
-# Fast Metadata Extraction (Max 3 Seconds Timeout)
+# Fast Metadata Extraction (Max 2 Seconds Timeout)
 # ============================================================
 def extract_metadata_fast(terabox_url: str) -> dict:
-    """Tries fast APIs with strict 3-sec timeout. If slow/sleeping, instantly falls back."""
+    """Tries fast APIs with strict 2-sec timeout. If slow/sleeping, instantly falls back."""
     try:
         r = session.post(
             'https://teraplayer-backend-temp.onrender.com/api/preview',
             json={'url': terabox_url},
-            timeout=3,
+            timeout=2,
         )
         if r.status_code == 200:
             d = r.json()
@@ -350,23 +351,21 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ''
     logging.info(f"--> User {user_id} sent message: {text[:80]}")
 
-    # Auto-detect channel ID if admin forwards a post from channel to bot
-    forward_chat = None
-    if update.message.forward_from_chat:
-        forward_chat = update.message.forward_from_chat
-    elif hasattr(update.message, 'forward_origin') and update.message.forward_origin:
-        if hasattr(update.message.forward_origin, 'chat'):
-            forward_chat = update.message.forward_origin.chat
-
-    if forward_chat and forward_chat.type == "channel":
-        save_channel_id(forward_chat.id)
-        await update.message.reply_text(
-            f"✅ <b>Channel ID Detect Ho Gaya:</b> <code>{forward_chat.id}</code>\n"
-            f"📢 <b>Title:</b> {html.escape(forward_chat.title or '')}\n\n"
-            f"Ab sabhi users ke liye channel join compulsory ho gaya hai! 🎉",
-            parse_mode=ParseMode.HTML
-        )
-        return
+    # Auto-detect channel ID safely if admin forwards a post from channel to bot
+    try:
+        origin = getattr(update.message, 'forward_origin', None)
+        forward_chat = getattr(origin, 'chat', None) if origin else getattr(update.message, 'forward_from_chat', None)
+        if forward_chat and getattr(forward_chat, 'type', '') in ['channel', 'supergroup']:
+            save_channel_id(forward_chat.id)
+            await update.message.reply_text(
+                f"✅ <b>Channel ID Detect Ho Gaya:</b> <code>{forward_chat.id}</code>\n"
+                f"📢 <b>Title:</b> {html.escape(forward_chat.title or '')}\n\n"
+                f"Ab sabhi users ke liye channel join compulsory ho gaya hai! 🎉",
+                parse_mode=ParseMode.HTML
+            )
+            return
+    except Exception as e:
+        logging.warning(f"Forward check ignored: {e}")
 
     # Check Force Subscription
     if not await is_subscribed(context, user_id):
@@ -478,7 +477,7 @@ def main():
     logging.info("🤖 TeraBox Bot starting...")
     start_health_server()
     if not BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN missing in .env file!")
+        logging.error("TELEGRAM_BOT_TOKEN missing in .env file!")
         return
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
