@@ -1,7 +1,7 @@
 """
 TeraBox Ad-Free Video Telegram Bot
 Universal - Sabhi TeraBox links chalega.
-Engine: Cloudflare HLS Stream via teraplayer API (retry + fallback).
+Engine: Multi-API extraction with teraplayer fallback.
 Features: Force Channel Subscription (F-Sub) + Health check for 24/7 Render deployment.
 """
 import sys, os, re, json, asyncio, logging, urllib.parse, html, time, threading
@@ -27,22 +27,51 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# Player pages
 WEBAPP_BASE = "https://sumitgautamad-rgb.github.io/teraplayer/"
+TERAPLAYER_URL = "https://www.teraplayer.in/"
 
 # ============================================================
 # Force Channel Subscription Configuration
 # ============================================================
 FORCE_CHANNEL_ID = -1003944764432
 FORCE_CHANNEL_LINK = "https://t.me/+RSEzFEAyHphmZjBl"
+CHANNEL_FILE = "channel_id.txt"
+
+def get_channel_id() -> int:
+    global FORCE_CHANNEL_ID
+    if os.path.exists(CHANNEL_FILE):
+        try:
+            with open(CHANNEL_FILE, "r") as f:
+                cid = int(f.read().strip())
+                if cid:
+                    return cid
+        except Exception:
+            pass
+    return FORCE_CHANNEL_ID
+
+def save_channel_id(cid: int):
+    global FORCE_CHANNEL_ID
+    FORCE_CHANNEL_ID = cid
+    try:
+        with open(CHANNEL_FILE, "w") as f:
+            f.write(str(cid))
+        logger.info(f"Saved channel ID to {CHANNEL_FILE}: {cid}")
+    except Exception as e:
+        logger.error(f"Failed to save channel id: {e}")
 
 async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """Check if the user has joined the compulsory channel."""
+    cid = get_channel_id()
+    if not cid:
+        return True
     try:
-        member = await context.bot.get_chat_member(chat_id=FORCE_CHANNEL_ID, user_id=user_id)
+        member = await context.bot.get_chat_member(chat_id=cid, user_id=user_id)
         status_str = str(getattr(member, 'status', member)).lower()
         return any(s in status_str for s in ['member', 'admin', 'owner', 'creator'])
     except Exception as e:
-        logger.info(f"User {user_id} is not subscribed to {FORCE_CHANNEL_ID}: {e}")
+        logger.info(f"User {user_id} is not subscribed to {cid}: {e}")
         return False
 
 def get_force_sub_keyboard():
@@ -100,69 +129,110 @@ def find_terabox_url(text):
     return None
 
 # ============================================================
-# Core: Extract video info via teraplayer API
+# API Engine 1: teraplayer-backend (preview + metadata)
 # ============================================================
-API_URL = 'https://teraplayer-backend-temp.onrender.com/api/download'
-MAX_RETRIES = 3
-RETRY_DELAYS = [3, 8, 15]
+TERAPLAYER_API = 'https://teraplayer-backend-temp.onrender.com/api'
 
-def extract_video(terabox_url: str) -> dict | None:
-    for attempt in range(MAX_RETRIES):
+def get_metadata_from_teraplayer(terabox_url: str) -> dict | None:
+    """Get title and thumbnail from teraplayer backend (works even when stream fails)."""
+    for endpoint in ['download', 'preview']:
         try:
-            logger.info(f"Attempt {attempt + 1}/{MAX_RETRIES} for: {terabox_url}")
             r = session.post(
-                API_URL,
+                f'{TERAPLAYER_API}/{endpoint}',
                 json={'url': terabox_url},
-                timeout=30,
+                timeout=25,
             )
-
             if r.status_code == 200:
                 d = r.json()
-                if d.get('ok') and d.get('stream_url'):
-                    title = d.get('title') or 'TeraBox Video'
-                    size_str = d.get('size_str') or ''
-                    duration = d.get('duration') or 0
-                    resolution = d.get('resolution') or ''
-                    stream_url = d.get('stream_url', '')
-                    thumbnail = d.get('thumbnail') or ''
+                title = d.get('title') or ''
+                thumbnail = d.get('thumbnail') or ''
+                size_str = d.get('size_str') or ''
+                duration = d.get('duration') or 0
+                resolution = d.get('resolution') or ''
+                stream_url = d.get('stream_url') or ''
 
-                    duration_str = ''
-                    if duration:
-                        m, s = divmod(int(duration), 60)
-                        duration_str = f"{m}:{s:02d}"
+                if title:
+                    title = re.sub(r'\s*-\s*Shared via TeraBox\s*$', '', title, flags=re.IGNORECASE)
+                    title = re.sub(r'\s*-\s*Share Files Online.*$', '', title, flags=re.IGNORECASE)
+                    title = title.strip()
 
-                    logger.info(f"✅ Got stream for: {title} ({size_str})")
+                if not title:
+                    title = "TeraBox Video"
+
+                if d.get('ok') and stream_url:
                     return {
                         'filename': title,
                         'size_str': size_str,
-                        'duration_str': duration_str,
+                        'duration': duration,
                         'resolution': resolution,
                         'stream_url': stream_url,
                         'thumbnail': thumbnail,
+                        'source': f'teraplayer-{endpoint}',
                     }
-                else:
-                    err = d.get('error') or 'Unknown error'
-                    logger.warning(f"API ok=false: {err}")
-                    if 'password' in str(err).lower():
-                        return {'error': '🔒 Yeh link password protected hai.'}
 
-            elif r.status_code in [502, 503]:
-                logger.warning(f"Server unavailable (attempt {attempt + 1}), retrying...")
-            else:
-                logger.warning(f"API returned status {r.status_code}")
-
-        except requests.exceptions.Timeout:
-            logger.warning(f"Timeout on attempt {attempt + 1}")
+                # Even if stream URL is not returned, metadata is valid!
+                if title != "TeraBox Video" or thumbnail:
+                    return {
+                        'filename': title,
+                        'size_str': size_str,
+                        'duration': duration,
+                        'resolution': resolution,
+                        'stream_url': '',
+                        'thumbnail': thumbnail,
+                        'source': f'teraplayer-{endpoint}-meta',
+                    }
         except Exception as e:
-            logger.warning(f"Error on attempt {attempt + 1}: {e}")
+            logger.warning(f"teraplayer {endpoint} error: {e}")
+    return None
 
-        if attempt < MAX_RETRIES - 1:
-            time.sleep(RETRY_DELAYS[attempt])
+# ============================================================
+# API Engine 2: MN-BOTS Cloudflare Worker
+# ============================================================
+MN_BOTS_API = 'https://terabox-api.mn-bots.workers.dev/download'
+
+def get_info_from_mnbots(terabox_url: str) -> dict | None:
+    """Try MN-BOTS worker API."""
+    try:
+        r = session.get(
+            MN_BOTS_API,
+            params={'url': terabox_url},
+            timeout=20,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            if d.get('success') and d.get('download_url'):
+                return {
+                    'filename': d.get('filename') or 'TeraBox Video',
+                    'size_str': d.get('size') or '',
+                    'stream_url': d.get('download_url', ''),
+                    'thumbnail': d.get('thumbnail') or '',
+                    'source': 'mn-bots',
+                }
+    except Exception as e:
+        logger.warning(f"MN-BOTS API error: {e}")
+    return None
+
+# ============================================================
+# Core: Extract video info (multi-engine)
+# ============================================================
+def extract_video(terabox_url: str) -> dict | None:
+    """Try multiple APIs to extract video info."""
+    logger.info(f"Trying teraplayer backend for: {terabox_url}")
+    result = get_metadata_from_teraplayer(terabox_url)
+    if result:
+        logger.info(f"✅ Got info from {result['source']}")
+        return result
+
+    logger.info(f"Trying MN-BOTS worker for: {terabox_url}")
+    result = get_info_from_mnbots(terabox_url)
+    if result:
+        logger.info(f"✅ Got info from {result['source']}")
+        return result
 
     return None
 
-
 def process_terabox_link(url: str) -> dict:
+    """Process TeraBox link and return video info with player URLs."""
     now = time.time()
     if url in video_cache:
         item = video_cache[url]
@@ -173,24 +243,44 @@ def process_terabox_link(url: str) -> dict:
 
     data = extract_video(url)
 
-    if not data:
-        return {'error': '❌ Video link process nahi ho paya. Kripya check karein ki TeraBox link valid hai.'}
+    if data:
+        filename = data.get('filename') or 'TeraBox Video'
+        size_str = data.get('size_str') or ''
+        duration = data.get('duration') or 0
+        resolution = data.get('resolution') or ''
+        stream_url = data.get('stream_url') or ''
+        thumbnail = data.get('thumbnail') or ''
+        source = data.get('source', 'api')
+    else:
+        filename = 'TeraBox Video'
+        size_str = ''
+        duration = 0
+        resolution = ''
+        stream_url = ''
+        thumbnail = ''
+        source = 'direct'
 
-    if 'error' in data:
-        return data
+    duration_str = ''
+    if duration:
+        m, s = divmod(int(duration), 60)
+        duration_str = f"{m}:{s:02d}"
 
-    stream_url = data['stream_url']
-    filename = data['filename']
-    size_str = data['size_str']
-    duration_str = data.get('duration_str', '')
-    resolution = data.get('resolution', '')
-    thumbnail = data.get('thumbnail', '')
+    # Browser URL: Opens directly on teraplayer.in which autoplays in browser
+    browser_url = f"{TERAPLAYER_URL}?url={urllib.parse.quote(url, safe='')}"
 
-    webapp_url = (
-        f"{WEBAPP_BASE}?v={urllib.parse.quote(stream_url, safe='')}"
-        f"&title={urllib.parse.quote(filename)}"
-        f"&size={urllib.parse.quote(size_str)}"
-    )
+    # WebApp URL: sumitgautamad-rgb player on GitHub Pages (with your Adsterra Ads!)
+    if stream_url:
+        webapp_url = (
+            f"{WEBAPP_BASE}?v={urllib.parse.quote(stream_url, safe='')}"
+            f"&title={urllib.parse.quote(filename)}"
+            f"&size={urllib.parse.quote(size_str)}"
+        )
+    else:
+        webapp_url = (
+            f"{WEBAPP_BASE}?url={urllib.parse.quote(url, safe='')}"
+            f"&title={urllib.parse.quote(filename)}"
+            f"&size={urllib.parse.quote(size_str)}"
+        )
 
     result = {
         'filename': filename,
@@ -200,11 +290,12 @@ def process_terabox_link(url: str) -> dict:
         'stream_url': stream_url,
         'thumbnail': thumbnail,
         'webapp_url': webapp_url,
+        'browser_url': browser_url,
+        'source': source,
     }
 
     video_cache[url] = {'data': result, 'time': now}
     return result
-
 
 # ============================================================
 # Telegram Handlers
@@ -234,7 +325,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(welcome, parse_mode=ParseMode.HTML)
 
-
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -256,34 +346,55 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 show_alert=True
             )
 
-
 async def setchannel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allows manual setting of channel ID: /setchannel -100xxxxxxxxxx"""
     if context.args:
         try:
             cid = int(context.args[0])
+            save_channel_id(cid)
             await update.message.reply_text(
-                f"✅ Force Sub Channel ID: <code>{cid}</code>",
+                f"✅ Force Sub Channel ID set to: <code>{cid}</code>\n"
+                f"Ab compulsory channel join system active hai!",
                 parse_mode=ParseMode.HTML
             )
             return
         except ValueError:
             pass
+    current = get_channel_id()
     await update.message.reply_text(
-        f"Channel ID: <code>{FORCE_CHANNEL_ID}</code>",
+        f"Usage: <code>/setchannel -100xxxxxxxxxx</code>\n\n"
+        f"Current Channel ID: <code>{current or 'Not Set'}</code>",
         parse_mode=ParseMode.HTML
     )
-
 
 async def chat_member_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Auto-detect Channel ID when bot is added as Admin in the channel."""
     if update.my_chat_member:
         chat = update.my_chat_member.chat
-        logger.info(f"Chat Member Updated: {chat.id} ({chat.title})")
-
+        if chat.type in ["channel", "supergroup"]:
+            save_channel_id(chat.id)
+            logger.info(f"Auto-saved Channel ID: {chat.id} ({chat.title})")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+
+    # Auto-detect channel ID if admin forwards a post from the channel to the bot
+    forward_chat = None
+    if update.message.forward_from_chat:
+        forward_chat = update.message.forward_from_chat
+    elif hasattr(update.message, 'forward_origin') and update.message.forward_origin:
+        if hasattr(update.message.forward_origin, 'chat'):
+            forward_chat = update.message.forward_origin.chat
+
+    if forward_chat and forward_chat.type == "channel":
+        save_channel_id(forward_chat.id)
+        await update.message.reply_text(
+            f"✅ <b>Channel ID Detect Ho Gaya:</b> <code>{forward_chat.id}</code>\n"
+            f"📢 <b>Title:</b> {html.escape(forward_chat.title or '')}\n\n"
+            f"Ab sabhi users ke liye channel join compulsory ho gaya hai! 🎉",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     # Check Force Subscription
     if not await is_subscribed(context, user_id):
@@ -314,7 +425,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text(
         "⚡ <b>Processing...</b>\n"
-        "Video link extract ho raha hai, please 5-10 second wait karein...",
+        "Video link extract ho raha hai, please 3-5 second wait karein...",
         parse_mode=ParseMode.HTML
     )
 
@@ -330,6 +441,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duration_str = result.get('duration_str', '')
     resolution = result.get('resolution', '')
     webapp_url = result['webapp_url']
+    browser_url = result.get('browser_url', webapp_url)
     thumbnail = result.get('thumbnail', '')
 
     safe_filename = html.escape(filename)
@@ -355,7 +467,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton(
                 "🌐 Browser mein kholein",
-                url=webapp_url
+                url=browser_url
             )
         ]
     ])
@@ -393,10 +505,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text(plain, reply_markup=keyboard)
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
-
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -408,7 +518,6 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-
 def start_health_server():
     port = int(os.environ.get("PORT", 0))
     if port:
@@ -416,7 +525,6 @@ def start_health_server():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         logger.info(f"Health server started on port {port} (Render ready)")
-
 
 def main():
     logger.info("🤖 TeraBox Bot starting...")
@@ -435,7 +543,6 @@ def main():
 
     logger.info("✅ Bot polling started with Force Channel Subscription!")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == '__main__':
     main()
