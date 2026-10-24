@@ -1,10 +1,10 @@
 """
 TeraBox Ad-Free Video Telegram Bot
 Universal - Sabhi TeraBox links chalega.
-Engine: Ultra-Fast Multi-API extraction with instant fallback.
+Engine: Ultra-Fast Multi-API extraction with instant fallback + Live /logs diagnostic.
 Features: Force Channel Subscription (F-Sub) + Health check for 24/7 Render deployment.
 """
-import sys, os, re, json, asyncio, logging, urllib.parse, html, time, threading
+import sys, os, re, json, asyncio, logging, urllib.parse, html, time, threading, collections
 from http.server import HTTPServer, BaseHTTPRequestHandler
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -25,6 +25,23 @@ from telegram.ext import (
 )
 
 load_dotenv()
+
+# In-memory log buffer for live diagnostics via /logs endpoint
+log_buffer = collections.deque(maxlen=150)
+
+class BufferLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            log_buffer.append(msg)
+        except Exception:
+            pass
+
+buffer_handler = BufferLogHandler()
+buffer_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(buffer_handler)
 
 # Bot Token with direct fallback so it NEVER fails on Render
 BOT_TOKEN = (
@@ -62,9 +79,9 @@ def save_channel_id(cid: int):
     try:
         with open(CHANNEL_FILE, "w") as f:
             f.write(str(cid))
-        logger.info(f"Saved channel ID to {CHANNEL_FILE}: {cid}")
+        logging.info(f"Saved channel ID to {CHANNEL_FILE}: {cid}")
     except Exception as e:
-        logger.error(f"Failed to save channel id: {e}")
+        logging.error(f"Failed to save channel id: {e}")
 
 async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """Check if the user has joined the compulsory channel."""
@@ -74,10 +91,11 @@ async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> boo
     try:
         member = await context.bot.get_chat_member(chat_id=cid, user_id=user_id)
         status_str = str(getattr(member, 'status', member)).lower()
-        return any(s in status_str for s in ['member', 'admin', 'owner', 'creator'])
+        is_sub = any(s in status_str for s in ['member', 'admin', 'owner', 'creator'])
+        logging.info(f"User {user_id} subscription status: {status_str} -> {is_sub}")
+        return is_sub
     except Exception as e:
-        logger.warning(f"Subscription check bypassed due to error for {user_id}: {e}")
-        # Agar check me koi error aye toh user ko block mat karo
+        logging.warning(f"Subscription check error for {user_id}: {e} (bypassed)")
         return True
 
 def get_force_sub_keyboard():
@@ -94,12 +112,6 @@ FORCE_SUB_MSG = (
 )
 
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 # Video cache: {url: {'data': {...}, 'time': float}}
 video_cache = {}
@@ -180,7 +192,7 @@ def extract_metadata_fast(terabox_url: str) -> dict:
                     'source': 'preview-fast',
                 }
     except Exception as e:
-        logger.info(f"Fast preview skipped: {e}")
+        logging.info(f"Fast preview skipped: {e}")
 
     # Fallback immediately in < 0.1s
     return {
@@ -254,7 +266,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
         return
     user_id = update.effective_user.id
-    logger.info(f"/start from user {user_id}")
+    logging.info(f"--> /start received from user {user_id}")
 
     # Force Subscription check
     if not await is_subscribed(context, user_id):
@@ -282,6 +294,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
     user_id = query.from_user.id
+    logging.info(f"--> Callback query: {query.data} from {user_id}")
 
     if query.data == "check_sub":
         if await is_subscribed(context, user_id):
@@ -328,14 +341,14 @@ async def chat_member_update_handler(update: Update, context: ContextTypes.DEFAU
         chat = update.my_chat_member.chat
         if chat.type in ["channel", "supergroup"]:
             save_channel_id(chat.id)
-            logger.info(f"Auto-saved Channel ID: {chat.id} ({chat.title})")
+            logging.info(f"Auto-saved Channel ID: {chat.id} ({chat.title})")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
         return
     user_id = update.effective_user.id
     text = update.message.text or ''
-    logger.info(f"Incoming message from user {user_id}: {text[:100]}")
+    logging.info(f"--> User {user_id} sent message: {text[:80]}")
 
     # Auto-detect channel ID if admin forwards a post from channel to bot
     forward_chat = None
@@ -357,6 +370,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check Force Subscription
     if not await is_subscribed(context, user_id):
+        logging.info(f"User {user_id} blocked: not subscribed")
         await update.message.reply_text(
             FORCE_SUB_MSG,
             reply_markup=get_force_sub_keyboard(),
@@ -367,6 +381,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     terabox_url = find_terabox_url(text)
 
     if not terabox_url:
+        logging.info(f"No terabox URL found in message from {user_id}")
         await update.message.reply_text(
             "⚠️ <b>TeraBox link nahi mila!</b>\n\n"
             "Kripya valid TeraBox link bhejein.\n"
@@ -376,6 +391,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    logging.info(f"Processing URL for {user_id}: {terabox_url}")
     # Send processing status immediately so user sees bot response in < 0.5s!
     status_msg = await update.message.reply_text(
         "⚡ <b>Processing...</b>\n"
@@ -383,8 +399,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, process_terabox_link, terabox_url)
+    result = await asyncio.to_thread(process_terabox_link, terabox_url)
+    logging.info(f"Extraction result: {result.get('filename')} (source: {result.get('source')})")
 
     filename = result['filename']
     size_str = result.get('size_str', '')
@@ -419,29 +435,33 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ])
 
-    # Direct edit of status_msg: Rock-solid, instant (<1s), never fails with "message not found"!
     try:
         await status_msg.edit_text(
             caption,
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML
         )
+        logging.info(f"✅ Successfully sent video buttons to user {user_id}")
     except Exception as e:
-        logger.error(f"Message edit error: {e}")
+        logging.error(f"Message edit error: {e}")
         try:
             await update.message.reply_text(caption, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         except Exception:
             pass
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Exception while handling an update:", exc_info=context.error)
+    logging.error("Exception while handling an update:", exc_info=context.error)
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
+        self.send_header('Content-type', 'text/plain; charset=utf-8')
         self.end_headers()
-        self.wfile.write(b"TeraBox Bot is running 24/7!")
+        if self.path == '/logs':
+            output = "\n".join(log_buffer) or "Bot running. No logs yet."
+            self.wfile.write(output.encode('utf-8', errors='replace'))
+        else:
+            self.wfile.write(b"TeraBox Bot is running 24/7! Visit /logs for real-time logs.")
 
     def log_message(self, format, *args):
         pass
@@ -452,10 +472,10 @@ def start_health_server():
         server = HTTPServer(("0.0.0.0", port), HealthHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        logger.info(f"Health server started on port {port} (Render ready)")
+        logging.info(f"Health server started on port {port} (diagnostics available at /logs)")
 
 def main():
-    logger.info("🤖 TeraBox Bot starting...")
+    logging.info("🤖 TeraBox Bot starting...")
     start_health_server()
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN missing in .env file!")
@@ -469,7 +489,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("✅ Bot polling started with Force Channel Subscription!")
+    logging.info("✅ Bot polling started with Force Channel Subscription!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
