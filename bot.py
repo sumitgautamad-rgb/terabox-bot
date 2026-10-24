@@ -26,7 +26,12 @@ from telegram.ext import (
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Bot Token with direct fallback so it NEVER fails on Render
+BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("BOT_TOKEN")
+    or "8696081950:AAEBf-VeL_3AiFZ6O3cGYrnrWJKIPdUVY_g"
+)
 
 # Player pages
 WEBAPP_BASE = "https://sumitgautamad-rgb.github.io/teraplayer/"
@@ -36,7 +41,7 @@ TERAPLAYER_URL = "https://www.teraplayer.in/"
 # Force Channel Subscription Configuration
 # ============================================================
 FORCE_CHANNEL_ID = -1003944764432
-FORCE_CHANNEL_LINK = "https://t.me/+RSEzFEAyHphmZjBl"
+FORCE_CHANNEL_LINK = "https://t.me/+idhRMGF5qO8xNDU1"
 CHANNEL_FILE = "channel_id.txt"
 
 def get_channel_id() -> int:
@@ -71,8 +76,9 @@ async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> boo
         status_str = str(getattr(member, 'status', member)).lower()
         return any(s in status_str for s in ['member', 'admin', 'owner', 'creator'])
     except Exception as e:
-        logger.info(f"User {user_id} is not subscribed to {cid}: {e}")
-        return False
+        logger.warning(f"Subscription check bypassed due to error for {user_id}: {e}")
+        # Agar check karne me koi error aye toh bot freeze nahi hoga
+        return True
 
 def get_force_sub_keyboard():
     return InlineKeyboardMarkup([
@@ -122,6 +128,8 @@ TERABOX_DOMAINS = [
 ]
 
 def find_terabox_url(text):
+    if not text:
+        return None
     urls = re.findall(r'https?://[^\s<>"\']+', text)
     for u in urls:
         if any(d in u.lower() for d in TERABOX_DOMAINS):
@@ -140,7 +148,7 @@ def get_metadata_from_teraplayer(terabox_url: str) -> dict | None:
             r = session.post(
                 f'{TERAPLAYER_API}/{endpoint}',
                 json={'url': terabox_url},
-                timeout=25,
+                timeout=20,
             )
             if r.status_code == 200:
                 d = r.json()
@@ -196,7 +204,7 @@ def get_info_from_mnbots(terabox_url: str) -> dict | None:
         r = session.get(
             MN_BOTS_API,
             params={'url': terabox_url},
-            timeout=20,
+            timeout=15,
         )
         if r.status_code == 200:
             d = r.json()
@@ -302,7 +310,10 @@ def process_terabox_link(url: str) -> dict:
 # ============================================================
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
     user_id = update.effective_user.id
+    logger.info(f"/start from user {user_id}")
 
     # 1. Force Subscription check
     if not await is_subscribed(context, user_id):
@@ -327,6 +338,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
     user_id = query.from_user.id
 
     if query.data == "check_sub":
@@ -339,7 +352,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await query.edit_message_text(welcome_after, parse_mode=ParseMode.HTML)
             except Exception:
-                await query.message.reply_text(welcome_after, parse_mode=ParseMode.HTML)
+                if query.message:
+                    await query.message.reply_text(welcome_after, parse_mode=ParseMode.HTML)
         else:
             await query.answer(
                 "❌ Aapne abhi tak channel join nahi kiya hai! Kripya pehle 'Join Channel' par click karke channel join karein.",
@@ -348,6 +362,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setchannel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allows manual setting of channel ID: /setchannel -100xxxxxxxxxx"""
+    if not update.message:
+        return
     if context.args:
         try:
             cid = int(context.args[0])
@@ -376,7 +392,11 @@ async def chat_member_update_handler(update: Update, context: ContextTypes.DEFAU
             logger.info(f"Auto-saved Channel ID: {chat.id} ({chat.title})")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
     user_id = update.effective_user.id
+    text = update.message.text or ''
+    logger.info(f"Incoming message from user {user_id}: {text[:100]}")
 
     # Auto-detect channel ID if admin forwards a post from the channel to the bot
     forward_chat = None
@@ -405,7 +425,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    text = update.message.text or ''
     terabox_url = find_terabox_url(text)
 
     if not terabox_url:
@@ -495,15 +514,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Message send error: {e}")
-        plain = (
-            f"🎬 {filename}\n\n"
-            f"📦 Size: {size_str}\n\n"
-            "👇 Niche button tap karein:"
-        )
         try:
-            await status_msg.edit_text(plain, reply_markup=keyboard)
+            await update.message.reply_text(caption, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         except Exception:
-            await update.message.reply_text(plain, reply_markup=keyboard)
+            pass
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
