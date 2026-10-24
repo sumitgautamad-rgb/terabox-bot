@@ -1,7 +1,7 @@
 """
 TeraBox Ad-Free Video Telegram Bot
 Universal - Sabhi TeraBox links chalega.
-Engine: Ultra-Fast Multi-API extraction with instant fallback + Live /logs diagnostic.
+Engine: Direct TeraBox Embed Player + High-Res Thumbnail Extraction.
 Features: Force Channel Subscription (F-Sub) + Health check for 24/7 Render deployment.
 """
 import sys, os, re, json, asyncio, logging, urllib.parse, html, time, threading, collections
@@ -10,10 +10,9 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.constants import ParseMode, ChatAction, ChatMemberStatus
+from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -50,9 +49,8 @@ BOT_TOKEN = (
     or "8696081950:AAEBf-VeL_3AiFZ6O3cGYrnrWJKIPdUVY_g"
 )
 
-# Player pages
+# Player page (GitHub Pages)
 WEBAPP_BASE = "https://sumitgautamad-rgb.github.io/teraplayer/"
-TERAPLAYER_URL = "https://www.teraplayer.in/"
 
 # ============================================================
 # Force Channel Subscription Configuration
@@ -113,21 +111,18 @@ FORCE_SUB_MSG = (
 
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
-# Video cache: {url: {'data': {...}, 'time': float}}
-video_cache = {}
-CACHE_EXPIRY = 3 * 3600  # 3 hours
-
 session = requests.Session()
-adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+adapter = HTTPAdapter(pool_connections=15, pool_maxsize=15)
 session.mount('https://', adapter)
 session.mount('http://', adapter)
 session.headers.update({
     'User-Agent': UA,
-    'Accept': 'application/json, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 })
 
 # ============================================================
-# All TeraBox/mirror domains
+# TeraBox URL Detection & SURL Extraction
 # ============================================================
 TERABOX_DOMAINS = [
     'terabox.com', 'terabox.app', 'teraboxapp.com',
@@ -139,7 +134,7 @@ TERABOX_DOMAINS = [
     'teraboxshare.com', 'terashare.net', 'teraboxh5.com',
 ]
 
-def find_terabox_url(text):
+def find_terabox_url(text: str) -> str | None:
     if not text:
         return None
     urls = re.findall(r'https?://[^\s<>"\']+', text)
@@ -148,116 +143,64 @@ def find_terabox_url(text):
             return u
     return None
 
-def extract_quick_title(terabox_url: str) -> str:
-    """Extract a clean readable title from the URL itself as instant fallback."""
+def extract_surl(url: str) -> str:
+    """Extract clean surl shortcode from any TeraBox link format."""
     try:
-        parts = terabox_url.rstrip('/').split('/')
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if 'surl' in qs:
+            s = qs['surl'][0]
+            return s[1:] if s.startswith('1') and len(s) > 10 else s
+        parts = parsed.path.rstrip('/').split('/')
         code = parts[-1].split('?')[0]
-        if code:
-            return f"TeraBox Video ({code[:8]})"
+        if code.startswith('1') and len(code) > 10:
+            return code[1:]
+        return code
     except Exception:
-        pass
-    return "TeraBox Video"
+        return "video"
 
-# ============================================================
-# Fast Metadata Extraction (Max 2 Seconds Timeout)
-# ============================================================
-def extract_metadata_fast(terabox_url: str) -> dict:
-    """Tries fast APIs with strict 2-sec timeout. If slow/sleeping, instantly falls back."""
-    try:
-        r = session.post(
-            'https://teraplayer-backend-temp.onrender.com/api/preview',
-            json={'url': terabox_url},
-            timeout=2,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            title = d.get('title') or ''
-            thumbnail = d.get('thumbnail') or ''
-            stream_url = d.get('stream_url') or ''
-            size_str = d.get('size_str') or ''
-            duration = d.get('duration') or 0
+# Cache: {url: {'data': {...}, 'time': float}}
+meta_cache = {}
+CACHE_EXPIRY = 6 * 3600  # 6 hours
 
-            if title:
-                title = re.sub(r'\s*-\s*Shared via TeraBox\s*$', '', title, flags=re.IGNORECASE)
-                title = re.sub(r'\s*-\s*Share Files Online.*$', '', title, flags=re.IGNORECASE)
-                title = title.strip()
-
-            if title or thumbnail:
-                return {
-                    'filename': title or 'TeraBox Video',
-                    'thumbnail': thumbnail,
-                    'stream_url': stream_url,
-                    'size_str': size_str,
-                    'duration': duration,
-                    'source': 'preview-fast',
-                }
-    except Exception as e:
-        logging.info(f"Fast preview skipped: {e}")
-
-    # Fallback immediately in < 0.1s
-    return {
-        'filename': extract_quick_title(terabox_url),
-        'thumbnail': '',
-        'stream_url': '',
-        'size_str': '',
-        'duration': 0,
-        'source': 'instant-fallback',
-    }
-
-def process_terabox_link(url: str) -> dict:
-    """Process TeraBox link and return video info with player URLs."""
+def extract_metadata(url: str) -> dict:
+    """Extract real video title and high-res thumbnail directly from TeraBox page."""
     now = time.time()
-    if url in video_cache:
-        item = video_cache[url]
+    if url in meta_cache:
+        item = meta_cache[url]
         if now - item['time'] < CACHE_EXPIRY:
             return item['data']
-        else:
-            del video_cache[url]
 
-    data = extract_metadata_fast(url)
+    try:
+        r = session.get(url, timeout=7)
+        m_t = re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', r.text)
+        m_i = re.search(r'property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', r.text)
 
-    filename = data.get('filename') or 'TeraBox Video'
-    size_str = data.get('size_str', '')
-    duration = data.get('duration') or 0
-    stream_url = data.get('stream_url') or ''
-    thumbnail = data.get('thumbnail', '')
+        title = html.unescape(m_t.group(1)) if m_t else ''
+        title = re.sub(r'\s*-\s*Shared via TeraBox\s*$', '', title, flags=re.IGNORECASE)
+        title = re.sub(r'\s*-\s*Share Files Online.*$', '', title, flags=re.IGNORECASE).strip()
 
-    duration_str = ''
-    if duration:
-        m, s = divmod(int(duration), 60)
-        duration_str = f"{m}:{s:02d}"
+        thumb = html.unescape(m_i.group(1)) if m_i else ''
 
-    # Browser URL: Opens directly on teraplayer.in which autoplays
-    browser_url = f"{TERAPLAYER_URL}?url={urllib.parse.quote(url, safe='')}"
+        surl = extract_surl(url)
+        final_title = title or f"TeraBox Video ({surl[:8]})"
 
-    # WebApp URL: sumitgautamad-rgb player on GitHub Pages (with your Adsterra Ads!)
-    if stream_url:
-        webapp_url = (
-            f"{WEBAPP_BASE}?v={urllib.parse.quote(stream_url, safe='')}"
-            f"&title={urllib.parse.quote(filename)}"
-            f"&size={urllib.parse.quote(size_str)}"
-        )
-    else:
-        webapp_url = (
-            f"{WEBAPP_BASE}?url={urllib.parse.quote(url, safe='')}"
-            f"&title={urllib.parse.quote(filename)}"
-            f"&size={urllib.parse.quote(size_str)}"
-        )
-
-    result = {
-        'filename': filename,
-        'size_str': size_str,
-        'duration_str': duration_str,
-        'stream_url': stream_url,
-        'thumbnail': thumbnail,
-        'webapp_url': webapp_url,
-        'browser_url': browser_url,
-        'source': data.get('source', 'fast'),
-    }
-
-    video_cache[url] = {'data': result, 'time': now}
-    return result
+        data = {
+            'title': final_title,
+            'thumbnail': thumb,
+            'surl': surl,
+        }
+        meta_cache[url] = {'data': data, 'time': now}
+        return data
+    except Exception as e:
+        logging.warning(f"Metadata extraction error: {e}")
+        surl = extract_surl(url)
+        data = {
+            'title': f"TeraBox Video ({surl[:8]})",
+            'thumbnail': '',
+            'surl': surl,
+        }
+        return data
 
 # ============================================================
 # Telegram Handlers
@@ -269,7 +212,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logging.info(f"--> /start received from user {user_id}")
 
-    # Force Subscription check
     if not await is_subscribed(context, user_id):
         await update.message.reply_text(
             FORCE_SUB_MSG,
@@ -280,13 +222,13 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome = (
         "🎬 <b>TeraBox Video Player Bot</b>\n\n"
-        "Koi bhi TeraBox link bhejo — video seedha play hoga!\n\n"
+        "Koi bhi TeraBox link bhejo — direct play button aur thumbnail milega! ⚡\n\n"
         "📌 <b>Supported sites:</b>\n"
         "• 1024terabox.com\n"
         "• terabox.com / teraboxapp.com\n"
         "• freeterabox.com aur sabhi mirror sites\n\n"
         "✨ <b>Kaise use karein:</b>\n"
-        "Apna TeraBox video link yahan paste karein aur bhejein!"
+        "Apna TeraBox video link yahan bhejein!"
     )
     await update.message.reply_text(welcome, parse_mode=ParseMode.HTML)
 
@@ -302,7 +244,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("✅ Verified! Ab aap bot use kar sakte hain.", show_alert=True)
             welcome_after = (
                 "✅ <b>Welcome! Channel verified.</b>\n\n"
-                "Ab aap koi bhi TeraBox link yahan bhej sakte hain, video play ho jayegi! 🎬"
+                "Ab aap koi bhi TeraBox link yahan bhej sakte hain, direct video play hoga! 🎬"
             )
             try:
                 await query.edit_message_text(welcome_after, parse_mode=ParseMode.HTML)
@@ -391,33 +333,24 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     logging.info(f"Processing URL for {user_id}: {terabox_url}")
-    # Send processing status immediately so user sees bot response in < 0.5s!
     status_msg = await update.message.reply_text(
         "⚡ <b>Processing...</b>\n"
         "Video player link tayyar ho raha hai...",
         parse_mode=ParseMode.HTML
     )
 
-    result = await asyncio.to_thread(process_terabox_link, terabox_url)
-    logging.info(f"Extraction result: {result.get('filename')} (source: {result.get('source')})")
+    meta = await asyncio.to_thread(extract_metadata, terabox_url)
+    title = meta.get('title') or 'TeraBox Video'
+    thumbnail = meta.get('thumbnail') or ''
+    surl = meta.get('surl') or extract_surl(terabox_url)
 
-    filename = result['filename']
-    size_str = result.get('size_str', '')
-    duration_str = result.get('duration_str', '')
-    webapp_url = result['webapp_url']
-    browser_url = result.get('browser_url', webapp_url)
-    thumbnail = result.get('thumbnail', '')
+    webapp_url = f"{WEBAPP_BASE}?surl={surl}&title={urllib.parse.quote(title)}"
+    browser_url = f"https://www.1024tera.com/sharing/embed?surl={surl}"
 
-    safe_filename = html.escape(filename)
-
-    lines = [f"🎬 <b>{safe_filename}</b>\n"]
-    if size_str:
-        lines.append(f"📦 <b>Size:</b> <code>{html.escape(size_str)}</code>")
-    if duration_str:
-        lines.append(f"⏱️ <b>Duration:</b> <code>{html.escape(duration_str)}</code>")
-    lines.append("\n👇 <b>Niche button tap karein:</b>")
-
-    caption = "\n".join(lines)
+    caption = (
+        f"🎬 <b>{html.escape(title)}</b>\n\n"
+        f"👇 <b>Niche button tap karke video dekhein:</b>"
+    )
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -434,13 +367,28 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ])
 
+    if thumbnail:
+        try:
+            await status_msg.delete()
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=thumbnail,
+                caption=caption,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+            logging.info(f"✅ Sent video thumbnail & buttons to user {user_id}")
+            return
+        except Exception as e:
+            logging.warning(f"Thumbnail send failed ({e}), falling back to text edit")
+
     try:
         await status_msg.edit_text(
             caption,
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML
         )
-        logging.info(f"✅ Successfully sent video buttons to user {user_id}")
+        logging.info(f"✅ Sent video buttons to user {user_id} via text edit")
     except Exception as e:
         logging.error(f"Message edit error: {e}")
         try:
