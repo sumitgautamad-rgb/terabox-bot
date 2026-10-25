@@ -50,7 +50,7 @@ BOT_TOKEN = (
 )
 
 # Player page (GitHub Pages)
-WEBAPP_BASE = "https://sumitgautamad-rgb.github.io/teraplayer/"
+WEBAPP_BASE = "https://www.1024tera.com/sharing/embed"
 
 # ============================================================
 # Force Channel Subscription Configuration
