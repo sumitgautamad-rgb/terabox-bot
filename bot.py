@@ -50,7 +50,7 @@ BOT_TOKEN = (
 )
 
 # Player page (GitHub Pages)
-WEBAPP_BASE = "https://www.1024tera.com/sharing/embed"
+_site_base = os.getenv("WEBAPP_URL", "").rstrip("/") _site_base = os.getenv("WEBAPP_URL", "").rstrip("/") WEBAPP_BASE = f"{_site_base}/player" if _site_base else "https://terabox-bot-buf2.onrender.com/player" = f"{_site_base}/player" if _site_base else "https://terabox-bot-buf2.onrender.com/player" = "https://www.1024tera.com/sharing/embed"
 
 # ============================================================
 # Force Channel Subscription Configuration
@@ -344,7 +344,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thumbnail = meta.get('thumbnail') or ''
     surl = meta.get('surl') or extract_surl(terabox_url)
 
-    webapp_url = f"{WEBAPP_BASE}?surl={surl}&title={urllib.parse.quote(title)}"
+    webapp_url = f"{_site_base = os.getenv("WEBAPP_URL", "").rstrip("/") _site_base = os.getenv("WEBAPP_URL", "").rstrip("/") WEBAPP_BASE = f"{_site_base}/player" if _site_base else "https://terabox-bot-buf2.onrender.com/player" = f"{_site_base}/player" if _site_base else "https://terabox-bot-buf2.onrender.com/player"}?surl={surl}&title={urllib.parse.quote(title)}"
     browser_url = f"https://www.1024tera.com/sharing/embed?surl={surl}"
 
     caption = (
