@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title id="pageTitle">TeraVideo Player</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { background: #0d0d0d; color: #fff; font-family: sans-serif; min-height: 100vh; display: flex; flex-direction: column; align-items: center; }
+    .header { width: 100%; background: #111; padding: 10px 16px; border-bottom: 1px solid #222; font-size: 18px; font-weight: 700; }
+    .header span { color: #7c5cfc; }
+    .wrap { width: 100%; max-width: 900px; padding: 12px; }
+    .vtitle { font-size: 14px; color: #ccc; margin-bottom: 10px; word-break: break-word; }
+    video { width: 100%; border-radius: 10px; background: #000; max-height: 75vh; display: block; }
+    .actions { display: flex; gap: 10px; margin-top: 12px; }
+    .btn { flex: 1; padding: 12px; border-radius: 8px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; text-align: center; text-decoration: none; display: inline-block; background: #7c5cfc; color: #fff; }
+    #loader { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 20px; gap: 16px; width: 100%; }
+    .spinner { width: 44px; height: 44px; border: 4px solid #333; border-top-color: #7c5cfc; border-radius: 50%; animation: spin 0.9s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .ltxt { color: #aaa; font-size: 14px; }
+    .err { background: #2a1010; border: 1px solid #5a2020; border-radius: 10px; padding: 16px; color: #f88; margin: 20px; font-size: 14px; display: none; }
+  </style>
+</head>
+<body>
+  <div class="header">Tera<span>Video</span> ▶</div>
+  <div id="loader"><div class="spinner"></div><p class="ltxt">Video load ho rahi hai… ⏳</p></div>
+  <div class="err" id="err">⚠️ <span id="errmsg">Video load nahi ho saki.</span></div>
+  <div class="wrap" id="wrap" style="display:none">
+    <p class="vtitle" id="vtitle">TeraBox Video</p>
+    <video id="vid" controls playsinline autoplay preload="auto"></video>
+    <div class="actions">
+      <a class="btn" id="dlbtn" href="#">⬇️ Download</a>
+    </div>
+  </div>
+  <script>
+    const p = new URLSearchParams(location.search);
+    const surl = p.get('surl') || '';
+    const title = p.get('title') || 'TeraBox Video';
+    document.getElementById('vtitle').textContent = title;
+    document.getElementById('pageTitle').textContent = title;
+
+    async function load() {
+      if (!surl) { showErr('Invalid link'); return; }
+      try {
+        const r = await fetch('/api/get-video', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({url: 'https://1024terabox.com/s/' + surl})
+        });
+        const d = await r.json();
+        if (!d.success) { showErr(d.error || 'Error'); return; }
+        const info = d.data;
+        const fn = (info.title || title) + '.' + (info.ext || 'mp4');
+        const proxy = '/api/proxy-stream?url=' + encodeURIComponent(info.video_url) + '&filename=' + encodeURIComponent(fn);
+        const dl = proxy + '&download=1';
+        const vid = document.getElementById('vid');
+        vid.src = proxy;
+        vid.load();
+        document.getElementById('dlbtn').href = dl;
+        document.getElementById('dlbtn').setAttribute('download', fn);
+        document.getElementById('vtitle').textContent = info.title || title;
+        document.getElementById('loader').style.display = 'none';
+        document.getElementById('wrap').style.display = 'block';
+      } catch(e) { showErr('Server error: ' + e.message); }
+    }
+    function showErr(msg) {
+      document.getElementById('loader').style.display = 'none';
+      document.getElementById('errmsg').textContent = msg;
+      document.getElementById('err').style.display = 'block';
+    }
+    load();
+  </script>
+</body>
+</html>
